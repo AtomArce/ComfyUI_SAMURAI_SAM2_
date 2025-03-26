@@ -16,7 +16,6 @@ ComfyUI_dir = os.path.dirname(os.path.dirname(samurai_dir))
 sys.path.insert(0,ComfyUI_dir)
 
 def cleanup_memory():
-    """Очистка памяти CUDA"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
@@ -225,7 +224,7 @@ class SAMURAIRefineNode:
             }
         }
     
-    RETURN_TYPES = ("MASK",)
+    RETURN_TYPES = ("MASK","IMAGE")
     FUNCTION = "segment"
     CATEGORY = "SAMURAI"
     DESCRIPTION = """# SAMURAI Refine Node
@@ -262,9 +261,8 @@ This node performs video object segmentation using the SAMURAI model.
         self.predictor = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.reset_state()
-
+        self.model_dtype = torch.float32
     def reset_state(self):
-        """Сброс состояния узла"""
         if self.predictor is not None:
             del self.predictor
             self.predictor = None
@@ -284,15 +282,15 @@ This node performs video object segmentation using the SAMURAI model.
                                     "models", "sam2")
             model_path = os.path.join(models_path, model_name)
 
-            dtype = torch.float32
+
             if "-fp16" in model_name:
-                dtype = torch.float16
+                self.model_dtype = torch.float16
 
             self.predictor = load_model(
                 model_path = model_path,
                 model_cfg_path= config_file,
                 segmentor = "video",
-                dtype = dtype,
+                dtype = self.model_dtype,
                 device="cuda",
             )
 
@@ -353,8 +351,8 @@ This node performs video object segmentation using the SAMURAI model.
         
         
         num_frames, h, w, c = image.shape
-        
-       
+
+        og_h, og_w = h, w
         max_side = max(h, w)
         if max_side > resolution:
             scale = resolution / max_side
@@ -393,16 +391,22 @@ This node performs video object segmentation using the SAMURAI model.
                         video_path=temp_dir,
                         offload_video_to_cpu=False
                     )
-                    
-                    if box is not None:
 
-                        box_tensor = torch.tensor([[box[0], box[1], box[0] + box[2], box[1] + box[3]]], 
-                                                dtype=model_dtype,
+                    if box is not None:
+                        scale_w = w/og_w
+                        scale_h = h/og_h
+                        scaled_box = [
+                            box[0] * scale_w,
+                            box[1] * scale_h,
+                            box[2] * scale_w,
+                            box[3] * scale_h,
+                        ]
+                        box_tensor = torch.tensor([[scaled_box[0], scaled_box[1], scaled_box[0] + scaled_box[2], scaled_box[1] + scaled_box[3]]],
+                                                dtype= self.model_dtype,
                                                 device=self.device)
-                        print(f"Box tensor device: {box_tensor.device}")
-                        print(f"Box tensor shape: {box_tensor.shape}")
-                        print(f"Box tensor: {box_tensor}")
-                        
+                        # print(f"Box tensor device: {box_tensor.device}")
+                        # print(f"Box tensor shape: {box_tensor.shape}")
+                        # print(f"Box tensor: {box_tensor}")
                         _, obj_ids, masks = self.predictor.add_new_points_or_box(
                             inference_state=inference_state,
                             frame_idx=0,
@@ -414,10 +418,10 @@ This node performs video object segmentation using the SAMURAI model.
                     if points is not None and labels is not None:
                         points_tensor = torch.tensor(points, dtype=torch.float16, device='cuda')
                         labels_tensor = torch.tensor(labels, dtype=torch.int64, device='cuda')
-                        print(f"Points tensor device: {points_tensor.device}")
-                        print(f"Points tensor shape: {points_tensor.shape}")
-                        print(f"Labels tensor device: {labels_tensor.device}")
-                        print(f"Labels tensor shape: {labels_tensor.shape}")
+                        # print(f"Points tensor device: {points_tensor.device}")
+                        # print(f"Points tensor shape: {points_tensor.shape}")
+                        # print(f"Labels tensor device: {labels_tensor.device}")
+                        # print(f"Labels tensor shape: {labels_tensor.shape}")
                         
                         _, obj_ids, masks = self.predictor.add_new_points_or_box(
                             inference_state=inference_state,
@@ -434,8 +438,10 @@ This node performs video object segmentation using the SAMURAI model.
                         all_masks.append(mask)
                     
                     for current_frame_idx, current_obj_ids, current_masks in self.predictor.propagate_in_video(inference_state):
+                        # print(f"Processing frame {current_frame_idx}: mask shape = {current_masks.shape}")
                         mask = (current_masks > iou_threshold).float()
-                        
+                        # print(f"Mask sample (min/max values): {mask.min().item()}, {mask.max().item()}")
+
                         while len(all_masks) < current_frame_idx + 1:
                             all_masks.append(None)
                         all_masks[current_frame_idx] = mask
@@ -449,9 +455,28 @@ This node performs video object segmentation using the SAMURAI model.
                     
                     del inference_state
                     cleanup_memory()
-                    # has_nonzero = torch.any(sequence_masks != 0)
-                    # print(f"has_nonzero: {has_nonzero}")
-                    return (sequence_masks,)
+
+                    print(f"[DEBUG] sequence_masks shape pre convert: {sequence_masks.shape}")
+
+                    # Sanitize per-frame masks: [1, 1, H, W] → [H, W]
+                    clean_masks = []
+                    for i, m in enumerate(all_masks):
+                        if m is None:
+                            raise ValueError(f"Mask for frame {i} is None")
+
+                        if m.ndim == 4 and m.shape[:2] == (1, 1): #single object detection (ie B = 1)
+                            m = m.squeeze(0).squeeze(0)
+                        elif m.ndim == 3 and m.shape[0] == 1:  # if no B dim
+                            m = m.squeeze(0)
+                        clean_masks.append(m)
+
+                    # Stack → [B, H, W]
+                    sequence_masks = torch.stack(clean_masks, dim=0)
+
+                    # Final formatting
+                    sequence_masks = sequence_masks.clamp(0.0, 1.0).to(torch.float32)
+
+                    return (sequence_masks, sequence_masks)
                     
             except Exception as e:
                 print(f"Error during segmentation: {str(e)}")
