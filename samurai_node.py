@@ -61,24 +61,23 @@ This node allows you to select a region of interest (box) in the first frame of 
 3. Draw a box around the object you want to track
 4. Box coordinates will be passed to SAMURAI Refine node"""
 
-    def get_box(self, image, start_frame=0, refresh_input=0):
+    def get_box(image, start_frame=0, refresh_input=0):
         print(f"Getting box for frame {start_frame} (refresh state: {refresh_input})")
-        
+
         frame = image[start_frame].cpu().numpy()
         frame = (frame * 255).astype(np.uint8)
         frame = np.ascontiguousarray(frame)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        
-        
+
+
         window_name = f'Select Box - Frame {start_frame} (Refresh: {refresh_input}) - Press ENTER when done, ESC to cancel'
         cv2.destroyAllWindows()
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         box = cv2.selectROI(window_name, frame, fromCenter=False, showCrosshair=True)
-        print(f"box:{box}")
         cv2.destroyAllWindows()
-        
+
         cleanup_memory()
-        return (box, start_frame)  
+        return (box, start_frame)
 
 class SAMURAIPointsInputNode:
     @classmethod
@@ -86,7 +85,7 @@ class SAMURAIPointsInputNode:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "start_frame": ("START_FRAME", {
+                "start_frame": ("INT", {
                     "default": 0,
                     "min": 0,
                     "display": "number",
@@ -129,22 +128,17 @@ This node allows you to select points of interest in the first frame of a video 
 - Positive points (left click) indicate areas that belong to the object
 - Negative points (right click) indicate areas that belong to the background"""
 
-    def get_points(self, image, start_frame=0, refresh_input=0):
-        frame = image[start_frame].cpu().numpy()
-        
-        return (points_array, labels_array, start_frame)
 
     def get_points(self, image, start_frame=0, refresh_input=0):
-        
         frame = image[start_frame].cpu().numpy()
         frame = (frame * 255).astype(np.uint8)
         frame = np.ascontiguousarray(frame)
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        
+
         points = []
         labels = []
         frame_copy = frame.copy()
-        
+
         def mouse_callback(event, x, y, flags, param):
             nonlocal frame_copy, points, labels
             if event == cv2.EVENT_LBUTTONDOWN:
@@ -157,13 +151,13 @@ This node allows you to select points of interest in the first frame of a video 
                 labels.append(0)
                 cv2.circle(frame_copy, (x, y), 3, (0, 0, 255), -1)
                 cv2.imshow(window_name, frame_copy)
-        
+
         window_name = f'Select Points - Left: positive, Right: negative, ENTER: done, ESC: cancel (Refresh: {refresh_input})'
         cv2.destroyAllWindows()
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window_name, mouse_callback)
         cv2.imshow(window_name, frame_copy)
-        
+
         while True:
             key = cv2.waitKey(1) & 0xFF
             if key == 13:  # Enter
@@ -172,14 +166,14 @@ This node allows you to select points of interest in the first frame of a video 
                 points = []
                 labels = []
                 break
-        
+
         cv2.destroyAllWindows()
-        
-        points_array = np.array(points) if points else None
-        labels_array = np.array(labels) if labels else None
-        
+
+        points_array = np.array(points, dtype=np.float32) if points else None
+        labels_array = np.array(labels, dtype=np.int64) if labels else None
+
         cleanup_memory()
-        return (points_array, labels_array)
+        return (points_array, labels_array, start_frame)
 
 class SAMURAIRefineNode:
     @classmethod
@@ -201,19 +195,20 @@ class SAMURAIRefineNode:
             "required": {
                 "image": ("IMAGE",),
                 "model_name": (list(cls.MODEL_CONFIGS.keys()), {
-                    "default": "sam2.1_hiera_base_plus.safetensors"
+                    "default": "sam2.1_hiera_large.safetensors"
                 }),
-                "resolution": ("INT", {
-                    "default": 1024,
-                    "min": 64,
-                    "max": 2048,
-                    "step": 8
+                "resolution": (["Full", "512", "768", "1024", "2048"], {
+                    "default": "1024"
                 }),
                 "iou_threshold": ("FLOAT", {
                     "default": 0.1,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.01
+                }),
+                "smooth_mask": ("BOOLEAN", {
+                    "default": False,
+                    "label": "Smooth mask edges"
                 })
             },
             "optional": {
@@ -236,6 +231,7 @@ This node performs video object segmentation using the SAMURAI model.
 - **model_name**: SAMURAI model to use (required)
 - **resolution**: Maximum resolution for processing (default: 1024)
 - **iou_threshold**: Intersection over Union threshold (default: 0.1)
+    -Lower: more pixels, Higher: Stricter Model (only includes "easy" pixels)
 - **box**: Bounding box from SAMURAI Box Input (optional)
 - **points**: Point prompts for segmentation (optional)
 - **labels**: Labels for point prompts (optional)
@@ -296,7 +292,7 @@ This node performs video object segmentation using the SAMURAI model.
 
             print(f"Loaded checkpoint {model_name} with config {config_file}")
 
-    def segment(self, image, model_name, resolution=1024, iou_threshold=0.1, box=None, points=None, labels=None, start_frame=0):
+    def segment(self, image, model_name, resolution="1024", iou_threshold=0.1, smooth_mask=False, box=None, points=None, labels=None, start_frame=0):
         self.reset_state()
         self.load_model(model_name)
 
@@ -310,16 +306,12 @@ This node performs video object segmentation using the SAMURAI model.
         original_method = self.predictor.add_new_points_or_box
         
         def patched_method(*args, **kwargs):
-            print("\nDebug: add_new_points_or_box called")
-            print(f"Debug: kwargs keys = {kwargs.keys()}")
+            # print("\nDebug: add_new_points_or_box called")
+            # print(f"Debug: kwargs keys = {kwargs.keys()}")
             
             try:
                 if 'box' in kwargs:
                     box = kwargs['box']
-                    print(f"Debug: box device = {box.device}")
-                    print(f"Debug: box shape = {box.shape}")
-                    print(f"Debug: box dtype = {box.dtype}")
-                    
                     points = torch.zeros((0, 2), dtype=box.dtype, device=box.device)
                     labels = torch.zeros((0,), dtype=torch.int64, device=box.device)
                     
@@ -353,24 +345,22 @@ This node performs video object segmentation using the SAMURAI model.
         num_frames, h, w, c = image.shape
 
         og_h, og_w = h, w
-        max_side = max(h, w)
-        if max_side > resolution:
-            scale = resolution / max_side
-            new_h = int(h * scale)
-            new_w = int(w * scale)
-            
-            print(f"Resizing image from {h}x{w} to {new_h}x{new_w}")
-            print(f"Aspect ratio: {w/h:.2f} (original) -> {new_w/new_h:.2f} (resized)")
-            
-            image = F.interpolate(
-                image.permute(0, 3, 1, 2),
-                size=(new_h, new_w),
-                mode='bilinear',
-                align_corners=False
-            ).permute(0, 2, 3, 1)
-            
-            h, w = new_h, new_w
-        
+        scale = 1.0
+        if resolution != "Full":
+            resolution = int(resolution)
+            max_side = max(h, w)
+            if max_side > resolution:
+                scale = resolution / max_side
+                new_h = int(h * scale)
+                new_w = int(w * scale)
+                image = F.interpolate(
+                    image.permute(0, 3, 1, 2),
+                    size=(new_h, new_w),
+                    mode='bilinear',
+                    align_corners=False
+                ).permute(0, 2, 3, 1)
+                h, w = new_h, new_w
+
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
             frames_list = []
             for i in range(num_frames):
@@ -456,7 +446,7 @@ This node performs video object segmentation using the SAMURAI model.
                     del inference_state
                     cleanup_memory()
 
-                    print(f"[DEBUG] sequence_masks shape pre convert: {sequence_masks.shape}")
+                    # print(f"[DEBUG] sequence_masks shape pre convert: {sequence_masks.shape}")
 
                     # Sanitize per-frame masks: [1, 1, H, W] → [H, W]
                     clean_masks = []
@@ -475,6 +465,16 @@ This node performs video object segmentation using the SAMURAI model.
 
                     # Final formatting
                     sequence_masks = sequence_masks.clamp(0.0, 1.0).to(torch.float32)
+
+                    #rescale back to original image size
+                    if scale != 1.0:
+                        resize_mode = 'bilinear' if smooth_mask else 'nearest'
+                        sequence_masks = F.interpolate(
+                            sequence_masks.unsqueeze(1),  # [B, 1, H, W]
+                            size=(og_h, og_w),
+                            mode=resize_mode,
+                            align_corners=False if resize_mode == 'bilinear' else None
+                        ).squeeze(1)  # back to [B, H, W]
 
                     return (sequence_masks, sequence_masks)
                     
